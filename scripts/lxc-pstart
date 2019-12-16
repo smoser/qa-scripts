@@ -21,6 +21,29 @@ CLEANUPS = {}
 
 SHELL_DUMP = False
 
+PSUEDO_INIT_BLOB = """\
+#!/bin/sh
+KID=""
+do_exit() {
+    [ -z "$KID" ] || kill $KID
+    echo "good bye."
+}
+main() {
+    [ "$1" = "wait" ] && { return 0; }
+    trap "echo got SIGPWR; exit 0;" PWR
+    trap "echo got SIGQUIT; exit 0;" QUIT
+    trap do_exit EXIT
+    sleep 1d &
+    KID=$!
+    echo "init up. sleeping kid is pid $KID"
+    wait
+    ret=$?
+    echo "$KID finished $ret"
+    KID=""
+    exit $ret
+}
+main "$@"
+"""
 
 class SubpError(IOError):
     def __init__(self, cmd=None, rc=None, stdout=None, stderr=None, desc=None,
@@ -168,65 +191,31 @@ def fail(msg):
 
 def create_profile(remote, pname):
     rname = ''.join((remote, pname))
-    gw_cidr = "10.3.23.1/24"
-
-    netcfg, err, rc = lxc(['network', 'show', rname],
-                          ofmt=FMT_YAML, rcs=RC_ANY)
-    if rc == 0:
-        LOG.info("re-using existing network %s", rname)
-        LOG.debug("%s had config: %s", rname, netcfg)
-        gw_cidr = netcfg['config'].get('ipv4.address')
-        if not gw_cidr:
-            fail("No 'ipv4.address' in network config %s" % rname)
-    else:
-        out, err, rc = lxc(
-            ['network', 'create', rname, "ipv4.address=%s" % gw_cidr,
-             "ipv4.nat=true"],
-            fmsg="Failed to create network '%s'" % rname)
-
-        netcfg, err, rc = lxc(
-            ['network', 'show', rname],
-            fmsg="Failed show network after create: %s" % rname)
-
-        LOG.info("Created network '%s' with addr '%s'", rname, gw_cidr)
-
     profcfg, err, rc = lxc(['profile', 'show', rname],
                            ofmt=FMT_YAML, rcs=RC_ANY)
     if rc == 0:
         LOG.info("re-using existing profile %s", rname)
         LOG.debug("%s had config: %s", rname, profcfg)
     else:
-        init_cmd = ' '.join([PSUEDO_INIT_PATH, "--network=%s" % gw_cidr])
+        init_cmd = ' '.join([PSUEDO_INIT_PATH])
         profcfg = {
             "config": {"raw.lxc": "lxc.init.cmd=%s" % init_cmd},
-            "description": "Profile for psuedo-start.",
-            "devices": {"eth0": {"nictype": "bridged", "parent": pname,
-                                 "type": "nic"}}}
+            "description": "Profile for psuedo-start."}
         lxc(['profile', 'create', rname],
             fmsg="Failed to create profile %s" % rname)
         lxc(['profile', 'edit', rname], data=yaml.dump(profcfg).encode(),
             fmsg="Failed to set config for profile '%s'" % rname)
         LOG.info("Created profile '%s'", rname)
 
-    return profcfg, netcfg
-
-
-def get_psuedo_init_blob():
-    fpath = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), 'psuedo-init')
-    if not os.path.isfile(fpath):
-        fail("Expected to find psuedo-init at %s but it does not exist" %
-             fpath)
-    with open(fpath, "rb") as fp:
-        return fp.read(), fpath
+    return profcfg
 
 
 def do_start(remote, name, prof_name, ctn_cfg, cmd=None):
-    init_blob, pi_host_path = get_psuedo_init_blob()
+    init_blob = PSUEDO_INIT_BLOB.encode()
 
     rcontainer = remote + ":" + name if remote else name
 
-    prof_cfg, net_cfg = create_profile(remote, prof_name)
+    prof_cfg = create_profile(remote, prof_name)
 
     new_cfg = copy.deepcopy(ctn_cfg)
     new_cfg['profiles'] = (
@@ -234,8 +223,7 @@ def do_start(remote, name, prof_name, ctn_cfg, cmd=None):
 
     lxc(['config', 'edit', rcontainer], data=yaml.dump(new_cfg).encode())
 
-    LOG.debug("Pushing %s to %s/%s",
-              pi_host_path, rcontainer, PSUEDO_INIT_PATH)
+    LOG.debug("Pushing %s to %s/%s", "-", rcontainer, PSUEDO_INIT_PATH)
     lxc(['file', 'push', '--mode=0755', '--uid=0', '--gid=0', '-',
          rcontainer + PSUEDO_INIT_PATH],
         data=init_blob,
@@ -288,7 +276,7 @@ def main():
     for m in ('stop', 'start', 'clean'):
         mgroup.add_argument('--' + m, action='store_const', const=m,
                             dest='mode')
-    parser.add_argument('-b', '--bname', action='store', default='pstart0',
+    parser.add_argument('-b', '--bname', action='store', default='pstart1',
                         help='The name to use for items created.')
 
     parser.add_argument('-D', '--dump-commands', action='store_true',
